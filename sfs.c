@@ -7,17 +7,20 @@
 //Boot Block 		 =1
 //Super Block        =1
 //inode table block  =4 
+//Block Size 		 =512
+//No. of blocks      =100
+//Max File Length    =14
+//Inode Cache not implmented
+//security settings not implemented
+//journaling not implemented
+//Directory Support not implemented
 /////////////definitions/////////////////
-
-struct inode;
-struct super;
-
 
 #define BLOCKSIZE 512
 #define MAXBLOCK 100
 #define MAXSYSSIZE BLOCKSIZE*MAXBLOCK
 
-#define MAXDEVICE 10
+#define MAXFD 10
 #define MAXBOOTBLOCK 1
 #define MAXSUPERBLOCK 1
 #define MAXINODETABLEBLOCK 4
@@ -33,22 +36,24 @@ struct super;
 #define INODETABLEADDRESS (MAXBOOTBLOCK+MAXSUPERBLOCK)*BLOCKSIZE
 #define DATAADDRESS (MAXBOOTBLOCK+MAXSUPERBLOCK+MAXINODETABLEBLOCK)*BLOCKSIZE
 #define DATABLOCKSTART MAXBOOTBLOCK+MAXSUPERBLOCK+MAXINODETABLEBLOCK
-#define MAXDIRENTRYPPAGE BLOCKSIZE/sizeof(struct direntry)
+#define MAXDIRENTRYPPAGE (BLOCKSIZE-sizeof(struct direntrytop))/sizeof(struct direntry)
+#define PAGECOMP ((MAXINODETABLEBLOCK*BLOCKSIZE)%sizeof(struct inode))
+#define MAXINODE (MAXINODETABLEBLOCK*BLOCKSIZE)/(sizeof(struct inode))
+
 
 struct inode {
 	unsigned int	i_size;
 	unsigned int	i_atime;
 	unsigned int	i_ctime;
 	unsigned int	i_mtime;
-	unsigned short	i_blks[13]; //data block addressess
+	unsigned short	i_blks[MAXLINK]; //data block addressess
 	short		i_mode;
 	unsigned char	i_uid;
 	unsigned char	i_gid;
 	unsigned char	i_type;
 	unsigned char	i_lnk;
 };
-#define PAGECOMP ((MAXINODETABLEBLOCK*BLOCKSIZE)%sizeof(struct inode))
-#define MAXINODE (MAXINODETABLEBLOCK*BLOCKSIZE)/(sizeof(struct inode))
+
 struct super {
 	char sb_vname[MAXFNAME];
 	int	sb_nino;
@@ -75,19 +80,47 @@ struct direntrytop
 	char d_name[MAXFNAME];
 	unsigned short d_ino;
 	unsigned short d_num;
+	//unsigned short d_table[MAXDIRENTRYPPAGE];  //index for direntries in directory
+												 // implement later
 };
 
 
-
+///filesystem related/////////
 int mkfs(int fd);
 int loadfs(int fd);
+
+////debug//////////////////////
 void displaySuper(struct super *s);
 void displayInode(struct inode *r);
+
+/////file operations interface//////////////////////
 int createFile(int dirhandle, char *fname, int mode, int uid, int gid);
+int openfile(char *fname,int mode, int uid, int gid);
+int writeFile(int filehandle,int mode, int uid, int gid);
+
+
+////utilities////////////////////////////////
+int genearteDataBlockAdress(int d_no);
+int generateInodeIndexAdress(int i_no);
+void initInode(struct inode *node,int type);
+
+////Device Driver level//////////////////////
+int writeSuper(struct super *tsb);
+int writeInode(int i_no,struct inode *troot);
+int findFreeDirentry(int dirhandle,struct direntry *de);
+int findDirentry(int dirhandle,char *fname);
+int writeDirentry(int dirhandle,struct direntry *de);
+int readDirentrytop(int dirhandle,struct direntrytop *de);
+int writeDirentrytop(int dirhandle,struct direntrytop *de);
+
+
 
 ////////////////Main menu driven function////////////
 int main(int argc,char *argv[])
 {
+	printf("%d",(int)sizeof(struct direntry));
+	printf("%d",(int)sizeof(struct direntrytop));
+
 	int ret;
 	char buf[512];
 
@@ -155,6 +188,7 @@ int main(int argc,char *argv[])
 
 //////////Implementation//////////////////////////
 int devfd=-1;
+unsigned short descriptor[MAXFD];
 struct inode inodetable[MAXINODE];
 struct super sb;
 int loaded=0;
@@ -175,6 +209,9 @@ void initInode(struct inode *node,int type)
 	int i,cnt=0;
 	node->i_size=sizeof(struct inode);
 	node->i_atime=node->i_ctime=node->i_mtime=0;
+	node->i_mode=node->i_uid=node->i_gid=0;
+	node->i_type=type; //type of inode: dir/file/empty
+	node->i_lnk=0; 
 	for(i=0;i<MAXLINK;i++)node->i_blks[i]=0;
 	if( type == SDIR || type == SFILE) //if SEMP do not allocate data blocks
 	{
@@ -183,14 +220,12 @@ void initInode(struct inode *node,int type)
 			if(sb.sb_freeblks[i] == 0)
 			{
 				node->i_blks[cnt++]=i+1;
+				printf("Allocating block no. %d\n",i+1);
 				sb.sb_freeblks[i]=1;
 				sb.sb_nfreeblk--;
 			}
 		}
 	}
-	node->i_mode=node->i_uid=node->i_gid=0;
-	node->i_type=type; //type of inode: dir/file/empty
-	node->i_lnk=0; 
 }
 
 int mkfs(int fd)
@@ -212,44 +247,37 @@ int mkfs(int fd)
 	///////////////////////////////
 
 	//////Initialise Super block////
-	struct super tsb;
-	strcpy(tsb.sb_vname,FILESYSNAME);
-	tsb.sb_nino=MAXINODE;
-	tsb.sb_nfreeino=MAXINODE;
+	strcpy(sb.sb_vname,FILESYSNAME);
+	sb.sb_nino=MAXINODE;
+	sb.sb_nfreeino=MAXINODE;
 	printf("free block %d\n",MAXDATABLOCK);
-	tsb.sb_nblk=MAXDATABLOCK;
-	tsb.sb_nfreeblk=MAXDATABLOCK;
-	tsb.sb_blksize=BLOCKSIZE;
-	tsb.sb_flags=0;
+	sb.sb_nblk=MAXDATABLOCK;
+	sb.sb_nfreeblk=MAXDATABLOCK;
+	sb.sb_blksize=BLOCKSIZE;
+	sb.sb_flags=0;
 	for(i=0;i<MAXDATABLOCK;i++)
-		tsb.sb_freeblks[i]=0;
+		sb.sb_freeblks[i]=0;
 	for(i=0;i<MAXINODE;i++)
 		sb.sb_freeinos[i]=0;
-	tsb.sb_freeinos[0]=1;
-	tsb.sb_nfreeino--;
-	tsb.sb_chktime=sb.sb_ctime=0;
-
-	////write super block////////////
-	buf=(char *)malloc((MAXSUPERBLOCK*BLOCKSIZE)-sizeof(struct super));
-	bzero(buf,(MAXSUPERBLOCK*BLOCKSIZE)-sizeof(struct super));
-	lseek(fd,SUPADDRESS,SEEK_SET);
-	write(fd,&tsb,sizeof(struct super));
-	write(fd,buf,(MAXSUPERBLOCK*BLOCKSIZE)-sizeof(struct super));
+	sb.sb_freeinos[0]=1;
+	sb.sb_nfreeino--;
+	sb.sb_chktime=sb.sb_ctime=0;
 
 	/////////initialise rootdirectory inode///////
 	struct inode troot;
 	initInode(&troot,SDIR);
-	struct direntrytop de;
-	strcpy(de.d_name,"root");
-	de.d_ino=1;
-	de.d_num=1;
+	struct direntrytop tde;
+	strcpy(tde.d_name,"root");
+	tde.d_ino=1;
+	tde.d_num=1;
 	int adr=genearteDataBlockAdress(troot.i_blks[0]);
 	lseek(fd,adr,SEEK_SET);
-	write(fd,&de,sizeof(struct direntrytop));
+	write(fd,&tde,sizeof(struct direntrytop));
+
+	struct direntry de; //dummy entry
 	strcpy(de.d_name,"");
 	de.d_ino=0;
-	de.d_num=0;
-	for(i=0;i<MAXDIRENTRYPPAGE -1;i++) write(fd,&de,sizeof(struct direntrytop));
+	for(i=0;i<MAXDIRENTRYPPAGE -1;i++) write(fd,&de,sizeof(struct direntry)); //only filling one page with dummy entries
 
 	////write root inode a.k.a 0th entry of inodetable////////
 	lseek(fd,INODETABLEADDRESS,SEEK_SET);
@@ -264,6 +292,13 @@ int mkfs(int fd)
 	buf=(char *)malloc(PAGECOMP);
 	bzero(buf,PAGECOMP);
 	write(fd,bzero,PAGECOMP);
+
+	////write super block//////////// // to be written last
+	buf=(char *)malloc((MAXSUPERBLOCK*BLOCKSIZE)-sizeof(struct super));
+	bzero(buf,(MAXSUPERBLOCK*BLOCKSIZE)-sizeof(struct super));
+	lseek(fd,SUPADDRESS,SEEK_SET);
+	write(fd,&sb,sizeof(struct super));
+	write(fd,buf,(MAXSUPERBLOCK*BLOCKSIZE)-sizeof(struct super));
 	/////////////////////////////////////////////////////////////////
 	close(fd);
 	return 0;
@@ -297,17 +332,14 @@ void displayInode(struct inode *r)
 	printf("Displaying Inode Block------------------\n");
 	printf("inode size     :   %d\n",r->i_size);
 	printf("Type of inode  :   %s\n",(r->i_type == SDIR)?"directory":"file");
-	printf("DataBlocks allocated:\n");
+	printf("DataBlocks allocated: ");
 	int i;
-	if(r->i_type == SDIR || r->i_type == SDIR)
+	if(r->i_type == SDIR || r->i_type == SFILE)
 	{
 		for(i=0;i<MAXLINK;i++)
-		{
-			if(r->i_blks[i] != 0)
-				printf("%d ",r->i_blks[i]);
-		}
-		printf("\n");
+			printf("%d %c",r->i_blks[i]," \n"[i==(MAXLINK-1)]);
 	}
+	else printf("not allocated yet.\n");
 }
 
 int getFreeInodeIndex()
@@ -316,10 +348,7 @@ int getFreeInodeIndex()
 	for(i=0;i<MAXINODE;i++)
 	{
 		if(sb.sb_freeinos[i] == 0)
-		{
-			sb.sb_freeinos[i]=1;
 			return i+1;
-		}
 	}
 	return -1;
 }
@@ -346,16 +375,16 @@ void displayFileContents(int handle)  //dispalys file content based on file or d
 				rec++;
 			}
 
-			while( i< det.d_num && rec < MAXDIRENTRYPPAGE  && read(devfd,&de,sizeof(struct direntry)) == sizeof(struct direntry)) //potential error
+			while( i< det.d_num && rec < MAXDIRENTRYPPAGE  && read(devfd,&de,sizeof(struct direntry))) //potential error
 			{
-				printf("recno %d\n",rec);
+				printf("recno %d ino: %d\n",rec,de.d_ino);
 				if(de.d_ino > 0)
 				{
-					if(inodetable[de.d_ino].i_type == SDIR)
+					if(inodetable[de.d_ino-1].i_type == SDIR)
 					{
 						printf("Directory name: %s ----------- inode_no: %d\n",de.d_name,de.d_ino);
 					}
-					else if(inodetable[de.d_ino].i_type == SFILE)
+					else if(inodetable[de.d_ino-1].i_type == SFILE)
 					{
 						printf("File name: %s ----------- inode_no: %d\n",de.d_name,de.d_ino);
 					}
@@ -376,7 +405,7 @@ void displayFileContents(int handle)  //dispalys file content based on file or d
 	return;
 }
 
-int writeSuper(struct inode *tsb)
+int writeSuper(struct super *tsb)
 {
 	lseek(devfd,SUPADDRESS,SEEK_SET);
 	write(devfd,tsb,sizeof(struct super));
@@ -391,28 +420,119 @@ int writeInode(int i_no,struct inode *troot)
 	return 0;
 }
 
-int writeDirentry(int dirhandle,struct direntry de)
+int writeDirentry(int dirhandle,struct direntry *de)//finds a slot and write the entry
+{
+	int i=0,j=0;
+	struct direntry tde;
+	for(i=0;inodetable[dirhandle].i_blks[i]>0;i++)
+	{
+		int adr=0;
+		if(i==0)
+		{	
+			adr=genearteDataBlockAdress(inodetable[dirhandle].i_blks[i]);
+			adr+=sizeof(struct direntrytop);
+			lseek(devfd,adr,SEEK_SET);
+			int cnt=0;
+			for(j=0;j<MAXDIRENTRYPPAGE -1 ;j++)
+			{
+				read(devfd,&tde,sizeof(struct direntry));
+				if(tde.d_ino == 0)
+				{
+					lseek(devfd,adr+cnt*sizeof(struct direntry),SEEK_SET);
+					write(devfd,de,sizeof(struct direntry));
+					int t=adr+ cnt*sizeof(struct direntry);
+					printf("written at address %d\n",t);
+					return 0;
+				}
+				else cnt++;
+			}
+		}
+		else
+		{
+			adr=genearteDataBlockAdress(inodetable[dirhandle].i_blks[i]);
+			lseek(devfd,adr,SEEK_SET);
+			int cnt=0;
+			for(j=0;j<MAXDIRENTRYPPAGE;j++)
+			{
+				read(devfd,&tde,sizeof(struct direntry));
+				if(tde.d_ino == 0)
+				{
+					lseek(devfd,adr+cnt*sizeof(struct direntry),SEEK_SET);
+					write(devfd,de,sizeof(struct direntry));
+					return 0;
+				}
+				else cnt++;
+			}
+		}
+	}
+}
+int readDirentrytop(int dirhandle,struct direntrytop *de)
+{
+	int adr=genearteDataBlockAdress(inodetable[dirhandle].i_blks[0]);
+	lseek(devfd,adr,SEEK_SET);
+	read(devfd,de,sizeof(struct direntrytop));
+	return 0;
+}
+int writeDirentrytop(int dirhandle,struct direntrytop *de)
+{
+	int adr=genearteDataBlockAdress(inodetable[dirhandle].i_blks[0]);
+	lseek(devfd,adr,SEEK_SET);
+	write(devfd,de,sizeof(struct direntrytop));
+	return 0;
+}
+int findDirentry(int dirhandle,char *fname);
 {
 
 }
+int writeDirentry(int dirhandle,struct direntry *de)
+{
+
+}
+
+
 int createFile(int dirhandle, char *fname, int mode, int uid, int gid)
 {
 	printf("create file called\n");
 	displayFileContents(dirhandle);
 	int inodeindex=getFreeInodeIndex();
 	printf("free inode obtained is: %d\n",inodeindex);
-	struct troot;
-	initInode(&troot,SFILE);
+	initInode(&inodetable[inodeindex-1],SFILE);
+	displayInode(&inodetable[inodeindex-1]);
+	writeInode(inodeindex,&inodetable[inodeindex-1]);
 	sb.sb_freeinos[inodeindex-1]=1;
 	sb.sb_nfreeino--;
 
+
+	struct direntrytop tde;
 	struct direntry de;
 	strcpy(de.d_name,fname);
 	de.d_ino=inodeindex;
 	writeDirentry(dirhandle,&de);
-	writeInode(inodeindex,&troot);
 
+	readDirentrytop(dirhandle,&tde);
+	printf("read direntrytop: %s %d %d \n",tde.d_name,tde.d_ino,tde.d_num);
+	tde.d_num+=1;
+	writeDirentrytop(dirhandle,&tde);
+	displayFileContents(dirhandle);
+	writeSuper(&sb);
 	return 0;	
+}
+int openfile(int direhandle,char *fname,int mode, int uid, int gid)
+{
+	struct direntrytop tde;
+	readDirentrytop(dirhandle,&tde);
+	for(int i=0;;i++)
+	{
+
+	}
+}
+int writeFile(int filehandle,int mode, int uid, int gid)
+{
+
+}
+int readFile(int filehandle,int mode, int uid, int gid)
+{
+
 }
 
 
