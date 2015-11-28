@@ -113,7 +113,8 @@ struct openobject
 ///filesystem related/////////
 int mkfs(int fd);
 int mount(int fd);
-
+int unmount(void);
+int syncfs(void);
 ////debug//////////////////////
 void displaySuper(struct super *s);
 void displayInode(struct inode *r);
@@ -290,6 +291,17 @@ int loaded=0;									//denotes whether a device is mounted or not
 int pwdhandle = 0; 								//Initial Working directory inode = 0 i.e rot directory
 
 
+void initDirentryBuffer(struct direntry debuffer[])
+{
+	int i;
+	for(i=0;i<MAXDIRENTRYPPAGE;i++)
+	{
+		strcpy(debuffer[i].d_name,"");
+		debuffer[i].d_ino=0;
+		debuffer[i].d_offset=0;
+	}
+}
+
 int mkfs(int fd)
 {
 	char *buf;
@@ -327,19 +339,15 @@ int mkfs(int fd)
 
 	/////////initialise rootdirectory inode///////
 	initInode(&inodetable[0],SDIR);
-	for(i=0;i<MAXDIRENTRYPPAGE;i++)
-	{
-		strcpy(debuffer[i].d_name,"");
-		debuffer[i].d_ino=0;
-		debuffer[i].d_offset=0;
-	}
-
+	///////////Initilalising and writting dummy direntry array//////
+	initDirentryBuffer(debuffer);
 	for(i=0;i<INITIALPAGEALLOC;i++)
 	{
 		int adr=genearteDataBlockAdress(inodetable[0].i_blks[i]);
 		lseek(fd,adr,SEEK_SET);
-		write(fd,debuffer,sizeof(struct direntry)*MAXDIRENTRYPPAGE); //writting dummy direntry array
+		write(fd,debuffer,sizeof(struct direntry)*MAXDIRENTRYPPAGE); 
 	}
+
 	////write root directory inode a.k.a 0th entry of inodetable-- inodetable Array //////////////
 	lseek(fd,INODETABLEADDRESS,SEEK_SET);
 	write(fd,inodetable,sizeof(struct inode)*MAXINODE);
@@ -383,8 +391,43 @@ int mount(int fd)
 	}
 	return 0;
 }
+int unmount(void)
+{
+	if( loaded == -1 || devfd ==-1)
+	{
+		printf("No Mounted device.\n");
+		return -1;
+	}
+	else
+	{
+		int ret=syncfs();
+		if(ret == -1)
+			return ret;
+		else
+		{
+			close(devfd); //Do not close before sync
+			loaded=-1;
+			devfd=-1;
+			return 0;
+		}
+	}
+}
 
-///////////////////////DRBUG DISPLAY//////////////////////////////////
+
+
+/////////Dumps data structures from mainmemory to Disk////////
+/*should be called periodically*/
+int syncfs(void)
+{
+	///////Write Super Block////////
+	writeSuper(&sb);
+	//////Write Inode table////////
+	lseek(devfd,INODETABLEADDRESS,SEEK_SET);
+	write(devfd,inodetable,MAXINODE*sizeof(struct inode));
+	return 0;
+}
+
+///////////////////////DEBUG && DISPLAY//////////////////////////////////
 
 void displaySuper(struct super *s)
 {
@@ -450,7 +493,6 @@ void displayFileContents(int handle)  //dispalys file content based on file or d
 	return;
 }
 
-
 void displayOpenobject()
 {
 	int i;
@@ -475,9 +517,9 @@ void dispalyDirentry(struct direntry *de)
 		printf("============================================================================\n");
 	}
 	else printf("=======================Direntry contents is empty. =========================== \n");
-}//////////////////////////////////////////////////////////////////////////////
+}
 
-
+//////////////////////////////////////////////////////////////////////////////
 
 int getFreeInodeIndex()
 {
@@ -504,7 +546,62 @@ int writeInode(int i_no,struct inode *troot)
 	write(devfd,troot,sizeof(struct inode));
 	return 0;
 }
+int getFreeDataBlockIndex(struct super *sb)
+{
+	if(sb == NULL)
+	{
+		printf("Super block NULL\n");
+		return -1;
+	}
+	else
+	{	
+		int i;
+		for(i=0;i<MAXDATABLOCK;i++)
+			if(sb->sb_freeblks[i] == 0)
+				return i;
+		return -1;
+	}
+}
 
+int allocateNewBlock(int handle,int type)
+{
+	int i;
+	for(i=0;i<MAXLINK && inodetable[handle].i_blks[i] > 0;i++);
+	if(i == MAXLINK) 
+	{
+		printf("Capacity of directory full\n");
+		return -1;
+	}
+	else
+	{
+		int index=getFreeDataBlockIndex(&sb);
+		if(index == -1)
+		{
+			printf("No Free DataBlocks\n");
+			return -1;
+		}
+		inodetable[handle].i_blks[i]=index;
+		sb.sb_nfreeblk--;
+		sb.sb_freeblks[index]=1;
+		if(type == SDIR)
+		{
+			initDirentryBuffer(debuffer);
+			int adr=genearteDataBlockAdress(inodetable[handle].i_blks[i]);
+			lseek(devfd,adr,SEEK_SET);
+			write(devfd,debuffer,sizeof(struct direntry)*MAXDIRENTRYPPAGE); 
+			return 0;
+		}
+		else if(type == SFILE)
+		{
+			char charbuf[BLOCKSIZE];
+			bzero(charbuf,BLOCKSIZE);
+			int adr=genearteDataBlockAdress(inodetable[handle].i_blks[i]);
+			lseek(devfd,adr,SEEK_SET);
+			write(devfd,charbuf,BLOCKSIZE);
+			return 0;
+		}
+	}
+}
 int writeDirentry(int dirhandle,struct direntry *de,int flag)//finds a slot and write the entry
 {
 	unsigned int i=0,j=0,adr;
@@ -541,12 +638,26 @@ int writeDirentry(int dirhandle,struct direntry *de,int flag)//finds a slot and 
 			}
 		}
 	}
-	return -1;//no place found //allocate new data block and write //Add later
+	if(flag == FALLOC) //all page searched for free entry
+	{
+		int ret=allocateNewBlock(dirhandle,SDIR);
+		initDirentryBuffer(debuffer);
+		printf("allocating slot in direntry table: %d\n",0);
+		strcat(debuffer[0].d_name,de->d_name);
+		debuffer[0].d_ino=de->d_ino;
+		debuffer[0].d_offset=de->d_offset;
+		printf("written at address %d\n",adr);
+		lseek(devfd,adr,SEEK_SET);
+		write(devfd,debuffer,sizeof(struct direntry)*MAXDIRENTRYPPAGE);
+		return 0;
+	}
+	return -1;//only happens if file is searched and not found
 }
+
 
 int createFile(int dirhandle, char *fname, int mode, int uid, int gid)
 {
-	printf("create file called......\n");
+	printf("creating file=============================>>\n");
 	displayInode(&inodetable[dirhandle]);
 	displayFileContents(dirhandle);
 	//////////////////////////////////////////////////
@@ -557,7 +668,7 @@ int createFile(int dirhandle, char *fname, int mode, int uid, int gid)
 		printf("File already exists in this directory.Try another name.\n");
 		return -1;
 	}
-
+	//////get free inode//////////////////
 	int inodeindex=getFreeInodeIndex();
 	printf("free inode obtained is: %d\n",inodeindex);
 	initInode(&inodetable[inodeindex-1],SFILE);
@@ -577,6 +688,60 @@ int createFile(int dirhandle, char *fname, int mode, int uid, int gid)
 	writeSuper(&sb);
 	return 0;
 }
+
+int mkDir(int dirhandle, char *dname, int uid, int gid, int attrib)
+{
+	printf("creating Directory=============================>>\n");
+	displayInode(&inodetable[dirhandle]);
+	displayFileContents(dirhandle);
+	//////////////////////////////////////////////////
+	struct direntry *ret=searchFile(dirhandle,dname);
+	if( ret != NULL)
+	{
+		printf("returned value %d\n",ret->d_ino);
+		printf("Directory already exists in this directory.Try another name.\n");
+		return -1;
+	}
+	//////get free inode//////////////////
+	int inodeindex=getFreeInodeIndex();
+	printf("free inode obtained is: %d\n",inodeindex);
+	initInode(&inodetable[inodeindex-1],SDIR);
+	displayInode(&inodetable[inodeindex-1]);
+	////write Altered Inode  to Disk//////
+	writeInode(inodeindex,&inodetable[inodeindex-1]);
+	sb.sb_freeinos[inodeindex-1]=1;
+	sb.sb_nfreeino--;
+	struct direntry de;
+	strcpy(de.d_name,dname);
+	de.d_ino=inodeindex;
+	de.d_offset=0;
+	writeDirentry(dirhandle,&de,FALLOC);
+
+	////write Altered Super block to Disk//////
+	writeSuper(&sb);
+}
+
+int rmFile(int dirhandle, char *fname)  //removes a file
+{
+
+}
+int rmDir(int dirhandle, char *dname) //removes a directory if not empty
+{
+
+}
+int changeDirectory(int dirhandle,char *dname)
+/**FIXME:
+*only one level forward directory change at a time is allowed
+*and absolute path from root based directory change is allowed.
+*Extend this for relative backward and multilevel forward.
+*HINT: initilaise every directory with 2 files . and ..
+*. ---> consits information of present directory
+*.. --> consists information for parent directory
+**/
+{
+
+}
+
 
 struct direntry* searchFile(int dirhandle,char *fname)
 {
@@ -600,9 +765,6 @@ struct direntry* searchFile(int dirhandle,char *fname)
 	}
 	return NULL;
 }
-
-/////////////////////////////////////////////////////////////////////////////////
-
 
 int getOpenobjectIndex()
 {
@@ -636,7 +798,6 @@ int openFile(int dirhandle,char *fname,int mode, int uid, int gid)
 	dispalyDirentry(de);
 	return allocateOpenobject(de,mode);
 }
-
 
 int readFile(int fhandle, char buf[], int nbytes) //fhandle = open oject buufer index
 {
@@ -711,8 +872,6 @@ int writeFile(int fhandle, char buf[], int nbytes) //fhandle = open oject buffer
 	displayInode(&inodetable[inodeindex]);
 	return nbytes;
 }
-
-
 
 int closeFile(int fhandle) //fhandle = open oject buufer index
 /*Simultaneous file operations LOGIC:
